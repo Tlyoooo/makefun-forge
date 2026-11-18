@@ -1,67 +1,142 @@
-// github-forge: a standalone GitHub-compatible git forge.
+// github-forge — a GitHub-compatible git forge in one Node process.
 //
-// One process, no dependencies. It binds an ephemeral port, tells the
-// trial environment where it is (POST /register), serves until the
-// environment says the trial is over (GET /done), then exits 0.
+// Boot contract (make.fun agent/v1): bind an ephemeral port, POST
+// {"port": N} to $MAKEFUN_ENV_URL/register, poll $MAKEFUN_ENV_URL/done until
+// it answers {"done": true}, then exit 0. GET /healthz answers 200
+// {"ok": true} with no auth. Everything else requires the trial's bearer
+// token (MAKEFUN_SHOP_TOKEN): REST v3 under /api/v3, GraphQL at
+// /api/graphql, MCP at /mcp, and git smart HTTP at /{owner}/{repo}.git —
+// all served from one in-memory store (src/store.ts).
 
-import http from 'node:http';
+import { createServer } from 'node:http';
+import { Forge } from './src/store.ts';
+import { handleRest } from './src/rest.ts';
+import { handleGit } from './src/gitproto.ts';
+import { handleGraphql } from './src/graphql.ts';
+import { handleMcp } from './src/mcp.ts';
+import { authorized, parseJsonBody, readBody, sendError, sendJson } from './src/web.ts';
 
-const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+const forge = new Forge();
 
-function sendJson(res, status, value) {
-  const body = JSON.stringify(value);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-  });
-  res.end(body);
+function decodeSegment(segment) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
 }
 
-const server = http.createServer((req, res) => {
-  const path = (req.url ?? '/').split('?')[0];
-  if (req.method === 'GET' && path === '/healthz') {
+async function route(req, res) {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const path = url.pathname;
+
+  if (path === '/healthz') {
     sendJson(res, 200, { ok: true });
     return;
   }
-  sendJson(res, 404, { message: 'Not Found' });
-});
 
-await new Promise((resolve, reject) => {
-  server.once('error', reject);
-  server.listen(0, () => resolve());
-});
-const address = server.address();
-const port = typeof address === 'object' && address !== null ? address.port : 0;
+  const body = await readBody(req);
 
-async function registerWithEnv() {
-  const response = await fetch(`${envUrl}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ port }),
-  });
-  await response.arrayBuffer().catch(() => undefined);
-}
+  if (!authorized(req)) {
+    sendError(res, 401, 'Unauthorized');
+    return;
+  }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function pollUntilDone() {
-  for (;;) {
-    try {
-      const response = await fetch(`${envUrl}/done`);
-      const body = await response.json().catch(() => null);
-      if (body !== null && body.done === true) return;
-    } catch {
-      // The env is not answering yet; keep polling.
+  try {
+    if (path === '/api/graphql') {
+      if (req.method !== 'POST') {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      handleGraphql(forge, res, body);
+      return;
     }
-    await sleep(200);
+
+    if (path === '/mcp') {
+      if (req.method !== 'POST') {
+        sendError(res, 404, 'Not Found');
+        return;
+      }
+      handleMcp(forge, res, body);
+      return;
+    }
+
+    if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+      const segments = path
+        .slice('/api/v3'.length)
+        .split('/')
+        .filter((segment) => segment !== '')
+        .map(decodeSegment);
+      let jsonBody = {};
+      if (body.length > 0 && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method ?? '')) {
+        jsonBody = parseJsonBody(body);
+      }
+      const handled = handleRest(forge, req, res, url, segments, jsonBody);
+      if (!handled) sendError(res, 404, 'Not Found');
+      return;
+    }
+
+    const gitMatch = /^\/([^/]+)\/([^/]+)\.git(?:\/(.*))?$/.exec(path);
+    if (gitMatch !== null) {
+      const owner = decodeSegment(gitMatch[1]);
+      const repoName = decodeSegment(gitMatch[2]);
+      const tail = (gitMatch[3] ?? '')
+        .split('/')
+        .filter((segment) => segment !== '')
+        .map(decodeSegment);
+      const handled = await handleGit(forge, req, res, owner, repoName, tail, body);
+      if (!handled) sendError(res, 404, 'Not Found');
+      return;
+    }
+
+    sendError(res, 404, 'Not Found');
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && typeof error.status === 'number') {
+      sendError(res, error.status, error.message ?? 'Error');
+      return;
+    }
+    console.error('forge: request failed', error);
+    if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
+    else res.end();
   }
 }
 
-if (envUrl !== '') {
-  await registerWithEnv();
-  await pollUntilDone();
+const server = createServer((req, res) => {
+  route(req, res).catch((error) => {
+    console.error('forge: request failed', error);
+    if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
+    else res.end();
+  });
+});
+server.keepAliveTimeout = 75_000;
+server.headersTimeout = 80_000;
+
+await new Promise((resolve, reject) => {
+  server.once('error', reject);
+  server.listen(0, resolve);
+});
+const address = server.address();
+const port = typeof address === 'object' && address !== null ? address.port : 0;
+console.error(`github-forge listening on port ${port}`);
+
+const envUrl = process.env.MAKEFUN_ENV_URL;
+if (envUrl !== undefined && envUrl !== '') {
+  const base = envUrl.replace(/\/+$/, '');
+  await fetch(`${base}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ port }),
+  }).catch(() => undefined);
+  for (;;) {
+    try {
+      const answer = await fetch(`${base}/done`);
+      const payload = await answer.json().catch(() => null);
+      if (payload !== null && payload.done === true) break;
+    } catch {
+      // The env is not answering yet; keep polling.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
   server.close();
   process.exit(0);
 }
