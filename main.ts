@@ -29,6 +29,7 @@ function decodeSegment(segment) {
 async function route(req, res) {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const path = url.pathname;
+  res.setHeader('x-github-request-id', forge.nextRequestId());
 
   if (path === '/healthz') {
     sendJson(res, 200, { ok: true });
