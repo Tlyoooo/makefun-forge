@@ -473,7 +473,7 @@ async function receivePack(req, res, repo, body) {
   let unpackOk = true;
   if (packBytes.length > 0) {
     try {
-      const pack = await parsePack(packBytes, 0);
+      const pack = parsePack(packBytes, 0);
       resolvePack(pack, repo.objects);
     } catch (error) {
       unpackOk = false;

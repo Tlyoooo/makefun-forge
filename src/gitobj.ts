@@ -7,7 +7,7 @@
 // deterministic: no clocks, no randomness.
 
 import { createHash } from 'node:crypto';
-import { createInflate, deflateSync } from 'node:zlib';
+import { deflateSync, inflateSync } from 'node:zlib';
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 export const OBJECT_TYPES = ['commit', 'tree', 'blob', 'tag'];
@@ -331,16 +331,38 @@ export function mergeBase(store, a, b) {
 
 // ---------------------------------------------------------------- packs
 
-/** Inflate one zlib stream starting at `offset`; answers data + bytes consumed. */
-export function inflateAt(buffer, offset) {
-  return new Promise((resolve, reject) => {
-    const stream = createInflate();
-    const chunks = [];
-    stream.on('data', (chunk) => chunks.push(chunk));
-    stream.on('error', reject);
-    stream.on('end', () => resolve({ data: Buffer.concat(chunks), consumed: stream.bytesRead }));
-    stream.end(buffer.subarray(offset));
-  });
+/**
+ * Inflate the one zlib stream starting at `offset`, exactly: Node's zlib API
+ * reports no consumed-byte count, and inflateSync ignores trailing bytes but
+ * throws on a truncated stream — so the shortest prefix of the remaining
+ * buffer that inflates to the declared size IS the stream, found by binary
+ * search. Answers { data, consumed }.
+ */
+export function inflateAt(buffer, offset, expectedSize) {
+  const remaining = buffer.length - offset;
+  const attempt = (length) => {
+    try {
+      const data = inflateSync(buffer.subarray(offset, offset + length), {
+        maxOutputLength: expectedSize === undefined ? undefined : expectedSize,
+      });
+      if (expectedSize !== undefined && data.length !== expectedSize) return null;
+      return data;
+    } catch {
+      return null;
+    }
+  };
+  const whole = attempt(remaining);
+  if (whole === null) throw new Error('corrupt zlib stream in pack');
+  let lo = 1;
+  let hi = remaining;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (attempt(mid) !== null) hi = mid;
+    else lo = mid + 1;
+  }
+  const data = attempt(lo);
+  if (data === null) throw new Error('corrupt zlib stream in pack');
+  return { data, consumed: lo };
 }
 
 /** Apply a git delta payload to a base buffer. */
@@ -406,7 +428,7 @@ export function applyDelta(base, delta) {
  * and `end` is the offset just past the trailer. Delta payloads are NOT
  * applied here; resolvePack does that.
  */
-export async function parsePack(buffer, offset) {
+export function parsePack(buffer, offset) {
   if (buffer.length - offset < 12 + 20) throw new Error('pack is too short');
   if (buffer.toString('latin1', offset, offset + 4) !== 'PACK') throw new Error('pack signature missing');
   const version = buffer.readUInt32BE(offset + 4);
@@ -436,20 +458,19 @@ export async function parsePack(buffer, offset) {
         cursor += 1;
         back = ((back + 1) << 7) | (byte & 0x7f);
       }
-      const { data, consumed } = await inflateAt(buffer, cursor);
+      const { data, consumed } = inflateAt(buffer, cursor, size);
       entries.push({ kind: 'ofs', data, headerOffset, baseHeaderOffset: headerOffset - back });
       cursor += consumed;
     } else if (code === TYPE_CODES['ref-delta']) {
       const baseOid = buffer.toString('hex', cursor, cursor + 20);
       cursor += 20;
-      const { data, consumed } = await inflateAt(buffer, cursor);
+      const { data, consumed } = inflateAt(buffer, cursor, size);
       entries.push({ kind: 'ref', data, headerOffset, baseOid });
       cursor += consumed;
     } else {
       const type = CODE_TYPES[code];
       if (type === undefined) throw new Error(`unknown pack object type code ${code}`);
-      const { data, consumed } = await inflateAt(buffer, cursor);
-      if (data.length !== size) throw new Error(`pack object size mismatch: ${data.length} != ${size}`);
+      const { data, consumed } = inflateAt(buffer, cursor, size);
       entries.push({ kind: 'plain', type, data, headerOffset });
       cursor += consumed;
     }

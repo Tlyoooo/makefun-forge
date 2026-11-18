@@ -837,6 +837,8 @@ function contentsRoute(forge, req, res, url, repo, segments, method, body, heade
         git_url: '',
         download_url: '',
         type: 'file',
+        encoding: 'base64',
+        content: data.toString('base64'),
         _links: {},
       },
       commit: contentsCommitView(repo, commitOid),
