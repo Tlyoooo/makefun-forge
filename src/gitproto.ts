@@ -233,7 +233,13 @@ export function computeFetch(store, { wants, haves, clientShallow, depth, deepen
     }
   }
 
-  // Distances (in commit edges) from the wants.
+  // The depth limit, when the request carries one. A deepen request needs
+  // the boundary's distance first, so it is settled after the walk below.
+  let limit = null;
+  if (depth !== null && depth !== undefined) limit = depth;
+
+  // Distances (in commit edges) from the wants. With a plain depth limit the
+  // walk stops at the limit: nothing deeper can be delivered anyway.
   const distance = new Map();
   {
     const queue = [];
@@ -246,20 +252,23 @@ export function computeFetch(store, { wants, haves, clientShallow, depth, deepen
     }
     while (queue.length > 0) {
       const current = queue.shift();
+      const currentDistance = distance.get(current);
+      if (limit !== null && currentDistance + 1 >= limit) continue;
       const object = store.get(current);
       if (object === undefined || object.type !== 'commit') continue;
       for (const parent of parseCommit(object.data).parents) {
         if (!distance.has(parent)) {
-          distance.set(parent, distance.get(current) + 1);
+          distance.set(parent, currentDistance + 1);
           queue.push(parent);
         }
       }
     }
   }
 
-  let limit = null;
-  if (depth !== null && depth !== undefined) limit = depth;
-  else if (deepen !== null && deepen !== undefined) {
+  if (limit === null && deepen !== null && deepen !== undefined) {
+    // Deepen the client's shallow history: the boundary's distance from the
+    // wants, plus the requested extra generations. The walk above was
+    // unbounded (no plain limit), so boundary distances are exact.
     let boundaryDistance = 0;
     for (const oid of clientShallow) {
       if (distance.has(oid)) boundaryDistance = Math.max(boundaryDistance, distance.get(oid));
